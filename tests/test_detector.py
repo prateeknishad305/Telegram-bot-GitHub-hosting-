@@ -104,3 +104,89 @@ def test_render_dockerfile_has_expected_directives(tmp_path):
     assert "RUN npm install" in dockerfile
     assert f"EXPOSE {plan.app_port}" in dockerfile
     assert "CMD" in dockerfile
+
+
+def test_node_git_dependency_installs_git(tmp_path):
+    _write(
+        tmp_path / "package.json",
+        json.dumps(
+            {
+                "dependencies": {"some-lib": "git+https://github.com/owner/some-lib.git"},
+                "scripts": {"start": "node server.js"},
+            }
+        ),
+    )
+    plan = detect_plan(tmp_path)
+    assert plan.kind == "node"
+    assert any("git" in command for command in plan.setup_commands)
+    dockerfile = render_dockerfile(plan)
+    assert "git" in dockerfile and "ca-certificates" in dockerfile
+
+
+def test_node_native_dependency_installs_build_tools(tmp_path):
+    _write(
+        tmp_path / "package.json",
+        json.dumps({"dependencies": {"sharp": "^0.33"}, "scripts": {"start": "node server.js"}}),
+    )
+    plan = detect_plan(tmp_path)
+    assert any("build-essential" in command for command in plan.setup_commands)
+    assert any("python3" in command for command in plan.setup_commands)
+
+
+def test_php_composer_installs_composer(tmp_path):
+    _write(tmp_path / "composer.json", json.dumps({"require": {"monolog/monolog": "^3"}}))
+    _write(tmp_path / "index.php", "<?php echo 'hi';")
+    plan = detect_plan(tmp_path)
+    assert plan.kind == "php"
+    assert any("composer" in command for command in plan.setup_commands)
+    assert any("getcomposer.org" in command for command in plan.setup_commands)
+    assert plan.install_commands and plan.install_commands[0].startswith("COMPOSER_ALLOW_SUPERUSER=1")
+    dockerfile = render_dockerfile(plan)
+    assert "getcomposer.org/installer" in dockerfile
+
+
+def test_php_public_docroot(tmp_path):
+    _write(tmp_path / "composer.json", "{}")
+    _write(tmp_path / "public" / "index.php", "<?php echo 'hi';")
+    plan = detect_plan(tmp_path)
+    assert plan.kind == "php"
+    assert "-t public" in plan.run_command
+
+
+def test_php_without_composer_has_no_setup(tmp_path):
+    _write(tmp_path / "index.php", "<?php echo 'hi';")
+    plan = detect_plan(tmp_path)
+    assert plan.setup_commands == []
+    assert plan.install_commands == []
+
+
+def test_java_maven_picks_runnable_jar(tmp_path):
+    _write(tmp_path / "pom.xml", "<project></project>")
+    plan = detect_plan(tmp_path)
+    assert plan.kind == "java-maven"
+    assert "sources" in plan.run_command
+    assert "target" in plan.run_command
+    assert "target/*.jar" not in plan.run_command
+
+
+def test_java_gradle_spring_boot_uses_boot_run(tmp_path):
+    _write(tmp_path / "build.gradle", "plugins { id 'org.springframework.boot' version '3.3.0' }\n")
+    plan = detect_plan(tmp_path)
+    assert plan.kind == "java-gradle"
+    assert plan.run_command.endswith("bootRun")
+    assert any("Spring Boot" in note for note in plan.notes)
+
+
+def test_java_gradle_application_plugin_uses_run(tmp_path):
+    _write(tmp_path / "build.gradle", "plugins {\n    id 'application'\n}\n")
+    plan = detect_plan(tmp_path)
+    assert plan.kind == "java-gradle"
+    assert plan.run_command.endswith(" run")
+
+
+def test_java_gradle_plain_uses_jar(tmp_path):
+    _write(tmp_path / "build.gradle", "plugins { id 'java' }\n")
+    plan = detect_plan(tmp_path)
+    assert plan.kind == "java-gradle"
+    assert "build/libs" in plan.run_command
+    assert "bootRun" not in plan.run_command

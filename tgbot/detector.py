@@ -33,6 +33,7 @@ class RunPlan:
     build_commands: list[str]
     run_command: str
     app_port: int
+    setup_commands: list[str] = field(default_factory=list)
     uses_repo_dockerfile: bool = False
     is_api: bool = False
     health_path: str | None = None
@@ -91,6 +92,62 @@ def _detect_node_version(package: dict) -> str:
         if major >= 18:
             return str(major)
     return "20"
+
+
+_NODE_GIT_PREFIXES = ("git+", "git://", "github:", "gitlab:", "bitbucket:")
+
+_NODE_NATIVE_DEPS = {
+    "bcrypt",
+    "better-sqlite3",
+    "bufferutil",
+    "canvas",
+    "grpc",
+    "leveldown",
+    "node-gyp",
+    "node-sass",
+    "re2",
+    "secp256k1",
+    "sharp",
+    "sqlite3",
+    "utf-8-validate",
+    "zeromq",
+}
+
+
+def _node_needs_git(package: dict) -> bool:
+    for key in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+        value = package.get(key, {})
+        if not isinstance(value, dict):
+            continue
+        for spec in value.values():
+            spec = str(spec)
+            if spec.startswith(_NODE_GIT_PREFIXES):
+                return True
+            if spec.endswith(".git") and "://" in spec:
+                return True
+    return False
+
+
+def _node_needs_build_tools(package: dict, deps: dict) -> bool:
+    if package.get("gypfile") is True:
+        return True
+    return any(name in deps for name in _NODE_NATIVE_DEPS)
+
+
+def _node_setup_commands(package: dict, deps: dict) -> list[str]:
+    packages: list[str] = []
+    if _node_needs_git(package):
+        packages.extend(["git", "ca-certificates"])
+    if _node_needs_build_tools(package, deps):
+        packages.extend(["build-essential", "python3", "pkg-config"])
+    if not packages:
+        return []
+    unique = sorted(dict.fromkeys(packages))
+    return [
+        "apt-get update && apt-get install -y --no-install-recommends "
+        + " ".join(unique)
+        + " && rm -rf /var/lib/apt/lists/*"
+    ]
 
 
 def _plan_node(root: Path, override_port: int | None = None) -> RunPlan:
@@ -156,6 +213,7 @@ def _plan_node(root: Path, override_port: int | None = None) -> RunPlan:
             run = "node index.js"
 
     node_version = _detect_node_version(package)
+    setup = _node_setup_commands(package, deps)
     plan = RunPlan(
         kind="node",
         base_image=f"node:{node_version}-slim",
@@ -163,6 +221,7 @@ def _plan_node(root: Path, override_port: int | None = None) -> RunPlan:
         build_commands=build,
         run_command=run,
         app_port=app_port,
+        setup_commands=setup,
         is_api="express" in deps and not (is_next or is_vite or is_nuxt or is_cra) and not _has_web_ui(root),
         health_path="/health",
         notes=[f"package manager: {pm}"],
@@ -365,15 +424,37 @@ def _plan_ruby(root: Path, override_port: int | None = None) -> RunPlan:
 
 
 def _plan_php(root: Path, override_port: int | None = None) -> RunPlan:
-    install = ["composer install --no-interaction --no-progress"] if (root / "composer.json").exists() else []
+    has_composer = (root / "composer.json").exists()
+    setup: list[str] = []
+    install: list[str] = []
+    if has_composer:
+        setup = [
+            (
+                "apt-get update && apt-get install -y --no-install-recommends git unzip libzip-dev "
+                "&& docker-php-ext-install -j\"$(nproc)\" bcmath zip "
+                "&& rm -rf /var/lib/apt/lists/* "
+                "&& curl -sS https://getcomposer.org/installer -o /tmp/composer-setup.php "
+                "&& php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer "
+                "&& rm /tmp/composer-setup.php"
+            )
+        ]
+        install = [
+            "COMPOSER_ALLOW_SUPERUSER=1 composer install --no-interaction --no-progress --prefer-dist"
+        ]
+
     if (root / "artisan").exists():
         app_port = override_port or 8000
         run = f"php artisan serve --host=0.0.0.0 --port={app_port}"
         notes = ["Laravel detected"]
+    elif (root / "public" / "index.php").exists():
+        app_port = override_port or 8000
+        run = f"php -S 0.0.0.0:{app_port} -t public public/index.php"
+        notes = ["PHP built-in server (docroot: public)"]
     else:
         app_port = override_port or 8000
         run = f"php -S 0.0.0.0:{app_port} -t ."
         notes = ["PHP built-in server"]
+
     return RunPlan(
         kind="php",
         base_image="php:8.3-cli",
@@ -381,18 +462,26 @@ def _plan_php(root: Path, override_port: int | None = None) -> RunPlan:
         build_commands=[],
         run_command=run,
         app_port=app_port,
+        setup_commands=setup,
         notes=notes,
     )
 
 
+_JAR_PICK = (
+    "find {dir} -maxdepth 1 -name '*.jar' "
+    "! -name '*-sources.jar' ! -name '*-javadoc.jar' ! -name '*.original' | head -n 1"
+)
+
+
 def _plan_maven(root: Path, override_port: int | None = None) -> RunPlan:
     app_port = override_port or DEFAULT_PORT
+    run = f'java -jar "$({_JAR_PICK.format(dir="target")})"'
     return RunPlan(
         kind="java-maven",
         base_image="maven:3.9-eclipse-temurin-21",
         install_commands=[],
         build_commands=["mvn -q -DskipTests package"],
-        run_command="java -jar target/*.jar",
+        run_command=run,
         app_port=app_port,
         notes=["Maven project"],
     )
@@ -401,14 +490,33 @@ def _plan_maven(root: Path, override_port: int | None = None) -> RunPlan:
 def _plan_gradle(root: Path, override_port: int | None = None) -> RunPlan:
     app_port = override_port or DEFAULT_PORT
     gradlew = "sh ./gradlew" if (root / "gradlew").exists() else "gradle"
+    build_files = ("build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts")
+    build_text = "\n".join(_read_text(root / name) for name in build_files).lower()
+
+    has_application_plugin = bool(
+        re.search(r"id\s*\(?\s*[\"']application[\"']", build_text)
+        or re.search(r"apply\s+plugin\s*:\s*[\"']application[\"']", build_text)
+        or re.search(r"plugins\s*\{[^}]*\bapplication\b", build_text, re.DOTALL)
+    )
+
+    if "org.springframework.boot" in build_text:
+        run = f"{gradlew} bootRun"
+        notes = ["Gradle project", "Spring Boot detected"]
+    elif has_application_plugin:
+        run = f"{gradlew} run"
+        notes = ["Gradle project", "application plugin detected"]
+    else:
+        run = f'java -jar "$({_JAR_PICK.format(dir="build/libs")})"'
+        notes = ["Gradle project"]
+
     return RunPlan(
         kind="java-gradle",
         base_image="gradle:8-jdk21",
         install_commands=[],
         build_commands=[f"{gradlew} build -x test"],
-        run_command=f"{gradlew} bootRun",
+        run_command=run,
         app_port=app_port,
-        notes=["Gradle project"],
+        notes=notes,
     )
 
 
@@ -536,6 +644,9 @@ def render_dockerfile(plan: RunPlan) -> str:
         return "\n".join(lines) + "\n"
 
     lines.append("COPY . /app")
+
+    for command in plan.setup_commands:
+        lines.append(f"RUN {command}")
 
     if plan.all_commands and any("git+" in cmd or "git@" in cmd for cmd in plan.all_commands):
         lines.append(
