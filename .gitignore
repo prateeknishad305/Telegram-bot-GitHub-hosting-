@@ -111,6 +111,9 @@
 *.pem
 *.key
 
+# Runtime data (jobs, sqlite database, work dirs)
+**/data/
+
 # Temporary files
 *.tmp
 *.temp

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import os
 import secrets
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -53,6 +54,7 @@ class Settings(BaseSettings):
 
     web_host: str = Field(default="0.0.0.0", alias="WEB_HOST")
     web_port: int = Field(default=8080, alias="WEB_PORT")
+    runtime_port: int | None = Field(default=None, alias="PORT")
     enable_terminal: bool = Field(default=True, alias="ENABLE_TERMINAL")
 
     health_check_interval: int = Field(default=15, alias="HEALTH_CHECK_INTERVAL")
@@ -66,6 +68,13 @@ class Settings(BaseSettings):
 
     data_dir: Path = Field(default=Path("./data"), alias="DATA_DIR")
     docker_network: str = Field(default="tgbot-runner", alias="DOCKER_NETWORK")
+
+    @model_validator(mode="after")
+    def _apply_runtime_port(self) -> Settings:
+        explicit = os.environ.get("WEB_PORT") or "web_port" in self.model_fields_set
+        if self.runtime_port and not explicit:
+            self.web_port = self.runtime_port
+        return self
 
     @property
     def allowed_user_ids(self) -> set[int]:
