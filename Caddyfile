@@ -1,0 +1,18 @@
+# Reverse proxy with automatic HTTPS.
+# Replace runner.example.com with your domain.
+#
+# Path based previews (no wildcard DNS needed):
+runner.example.com {
+	reverse_proxy 127.0.0.1:8080
+}
+
+# Subdomain based previews (needs a wildcard DNS record *.runner.example.com).
+# Enable this block and set PREVIEW_BASE_DOMAIN=runner.example.com in .env.
+# Wildcard certificates require a DNS challenge, for example:
+#
+# *.runner.example.com {
+# 	tls {
+# 		dns cloudflare {env.CF_API_TOKEN}
+# 	}
+# 	reverse_proxy 127.0.0.1:8080
+# }

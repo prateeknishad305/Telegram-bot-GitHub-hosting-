@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Repo Runner</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <h1>Repo Runner</h1>
+      <span id="who" class="who"></span>
+    </header>
+
+    <main>
+      <section class="card">
+        <h2>Run a repository</h2>
+        <input id="repo-url" type="text" inputmode="url" placeholder="https://github.com/owner/repo" />
+        <input id="repo-branch" type="text" placeholder="branch (optional)" />
+        <button id="run-btn" class="primary">Run</button>
+        <p id="form-msg" class="msg"></p>
+      </section>
+
+      <section class="card">
+        <div class="row">
+          <h2>Your jobs</h2>
+          <button id="refresh-btn" class="ghost">Refresh</button>
+        </div>
+        <div id="jobs" class="jobs"></div>
+      </section>
+
+      <section id="terminal-panel" class="card" hidden>
+        <div class="row">
+          <h2 id="terminal-title">Terminal</h2>
+          <button id="terminal-close" class="ghost">Close</button>
+        </div>
+        <div id="terminal"></div>
+        <p id="terminal-msg" class="msg"></p>
+      </section>
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
