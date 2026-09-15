@@ -2,20 +2,52 @@ const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : 
 if (tg) {
   tg.ready();
   tg.expand();
-  if (tg.setHeaderColor) tg.setHeaderColor("#0f1218");
+  if (tg.setHeaderColor) tg.setHeaderColor("#0b0f17");
+  if (tg.setBackgroundColor) tg.setBackgroundColor("#0b0f17");
 }
 
 const $ = (id) => document.getElementById(id);
+
 let token = null;
 let pollTimer = null;
+let toastTimer = null;
 let term = null;
 let fitAddon = null;
 let socket = null;
 let activeJobId = null;
 
+const ICONS = {
+  play: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4.5v15l13-7.5z"/></svg>',
+  terminal:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="m8 10 2.5 2.5L8 15"/><path d="M13.5 15H17"/></svg>',
+  logs: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M5 6h14M5 12h14M5 18h9"/></svg>',
+  stop: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>',
+  copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M6 15H5.5A1.5 1.5 0 0 1 4 13.5v-8A1.5 1.5 0 0 1 5.5 4h8A1.5 1.5 0 0 1 15 5.5V6"/></svg>',
+  inbox:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12.5 5.5 5h13L21 12.5V18a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/><path d="M3 12.5h5l1.2 2.2h5.6L16 12.5h5"/></svg>',
+};
+
+function icon(name) {
+  const span = document.createElement("span");
+  span.style.display = "inline-flex";
+  span.innerHTML = ICONS[name] || "";
+  return span;
+}
+
 function setMsg(el, text, isError) {
   el.textContent = text || "";
   el.classList.toggle("error-text", Boolean(isError));
+}
+
+function toast(text, kind) {
+  const el = $("toast");
+  el.textContent = text;
+  el.className = "toast" + (kind ? " " + kind : "");
+  el.hidden = false;
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    el.hidden = true;
+  }, 2600);
 }
 
 async function authenticate() {
@@ -29,7 +61,9 @@ async function authenticate() {
   if (!res.ok) throw new Error(data.error || "Login failed");
   token = data.token;
   const user = data.user || {};
-  $("who").textContent = user.username ? "@" + user.username : user.first_name || "user";
+  const chip = $("who");
+  chip.textContent = user.username ? "@" + user.username : user.first_name || "user";
+  chip.hidden = false;
 }
 
 async function api(path, options) {
@@ -44,8 +78,18 @@ async function api(path, options) {
   return data;
 }
 
+const STATUS_LABELS = {
+  queued: "Queued",
+  cloning: "Cloning",
+  building: "Building",
+  running: "Running",
+  failed: "Failed",
+  stopped: "Stopped",
+  expired: "Expired",
+};
+
 function statusClass(status) {
-  return ["running", "failed", "building", "cloning", "queued"].includes(status) ? status : "";
+  return STATUS_LABELS[status] ? status : "";
 }
 
 function formatDuration(seconds) {
@@ -60,35 +104,47 @@ function formatDuration(seconds) {
   return s + "s";
 }
 
+function timeAgo(epochSeconds) {
+  if (!epochSeconds) return "";
+  const diff = Math.max(0, Math.floor(Date.now() / 1000 - epochSeconds));
+  if (diff < 60) return diff + "s ago";
+  if (diff < 3600) return Math.floor(diff / 60) + "m ago";
+  if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
+  return Math.floor(diff / 86400) + "d ago";
+}
+
+function metricChip(label, value) {
+  const span = document.createElement("span");
+  span.className = "metric";
+  span.append(label + " ");
+  const b = document.createElement("b");
+  b.textContent = value;
+  span.append(b);
+  return span;
+}
+
 function renderMetrics(metrics) {
   const box = document.createElement("div");
   box.className = "metrics";
-  const healthClass = metrics.health === "healthy" ? "ok" : metrics.health === "unhealthy" ? "bad" : "";
-  box.innerHTML =
-    '<span class="metric"><b class="health ' +
-    healthClass +
-    '">' +
-    metrics.health +
-    "</b></span>" +
-    '<span class="metric">uptime ' +
-    formatDuration(metrics.uptime_seconds) +
-    "</span>" +
-    '<span class="metric">req ' +
-    metrics.requests_total +
-    "</span>" +
-    '<span class="metric">failed ' +
-    metrics.requests_failed +
-    " (" +
-    metrics.error_rate +
-    "%)</span>" +
-    '<span class="metric">' +
-    (metrics.avg_latency_ms != null ? "lat " + metrics.avg_latency_ms + "ms" : "lat -") +
-    "</span>" +
-    '<span class="metric">checks ' +
-    metrics.health_checks_up +
-    "/" +
-    metrics.health_checks +
-    "</span>";
+
+  const health = document.createElement("span");
+  health.className = "metric";
+  const healthValue = document.createElement("b");
+  healthValue.className =
+    metrics.health === "healthy" ? "health ok" : metrics.health === "unhealthy" ? "health bad" : "health";
+  healthValue.textContent = metrics.health || "unknown";
+  health.append(healthValue);
+
+  const latency = metrics.avg_latency_ms != null ? metrics.avg_latency_ms + "ms" : "-";
+
+  box.append(
+    health,
+    metricChip("uptime", formatDuration(metrics.uptime_seconds)),
+    metricChip("req", String(metrics.requests_total)),
+    metricChip("failed", metrics.requests_failed + " (" + metrics.error_rate + "%)"),
+    metricChip("latency", latency),
+    metricChip("checks", metrics.health_checks_up + "/" + metrics.health_checks)
+  );
   return box;
 }
 
@@ -97,35 +153,95 @@ function openExternal(url) {
   else window.open(url, "_blank", "noopener");
 }
 
+async function copyLink(url) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(url);
+    } else {
+      const input = document.createElement("input");
+      input.value = url;
+      document.body.append(input);
+      input.select();
+      document.execCommand("copy");
+      input.remove();
+    }
+    toast("Link copied", "ok");
+  } catch (err) {
+    toast("Could not copy link", "err");
+  }
+}
+
+function actionButton(label, iconName, className, onClick) {
+  const button = document.createElement("button");
+  button.className = "btn small " + (className || "");
+  if (iconName) button.append(icon(iconName));
+  button.append(document.createTextNode(label));
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+function renderEmpty() {
+  const box = document.createElement("div");
+  box.className = "empty";
+  box.append(icon("inbox"));
+  const line1 = document.createElement("span");
+  line1.textContent = "No jobs yet";
+  const line2 = document.createElement("span");
+  line2.textContent = "Paste a GitHub repo above and hit Run to start one.";
+  box.append(line1, line2);
+  return box;
+}
+
 function renderJobs(jobs) {
   const container = $("jobs");
+  const count = $("job-count");
   container.innerHTML = "";
+  count.textContent = jobs.length ? String(jobs.length) : "";
+  count.style.display = jobs.length ? "inline-block" : "none";
+
   if (!jobs.length) {
-    container.innerHTML = '<p class="msg">No jobs yet.</p>';
+    container.append(renderEmpty());
     return;
   }
+
   jobs.forEach((job) => {
     const card = document.createElement("div");
     card.className = "job";
 
     const head = document.createElement("div");
     head.className = "head";
-    const repo = document.createElement("span");
+
+    const titleWrap = document.createElement("div");
+    const repo = document.createElement("div");
     repo.className = "repo";
     repo.textContent = job.repo_full_name;
+    const sub = document.createElement("div");
+    sub.className = "sub";
+    sub.textContent =
+      (job.branch ? job.branch + " - " : "") +
+      timeAgo(job.created_at) +
+      (job.is_api ? " - API" : "");
+    titleWrap.append(repo, sub);
+
     const badge = document.createElement("span");
     badge.className = "badge " + statusClass(job.status);
-    badge.textContent = job.status + (job.is_api ? " - api" : "");
-    head.append(repo, badge);
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    badge.append(dot, document.createTextNode(STATUS_LABELS[job.status] || job.status));
+    head.append(titleWrap, badge);
 
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    meta.textContent =
-      "job " +
-      job.id +
-      (job.app_port ? " - port " + job.app_port : "") +
-      (job.run_command ? " - " + job.run_command : "") +
-      (job.error ? " - " + String(job.error).slice(0, 120) : "");
+    card.append(head);
+
+    if (job.error) {
+      const error = document.createElement("div");
+      error.className = "error";
+      error.textContent = String(job.error).slice(0, 240);
+      card.append(error);
+    }
+
+    if (job.status === "running" && job.metrics) {
+      card.append(renderMetrics(job.metrics));
+    }
 
     const actions = document.createElement("div");
     actions.className = "actions";
@@ -134,39 +250,28 @@ function renderJobs(jobs) {
       const preview = document.createElement("a");
       preview.className = "primary-link";
       preview.href = job.preview_url;
-      preview.textContent = job.is_api ? "Open API" : "Open app";
+      preview.append(icon("play"));
+      preview.append(document.createTextNode(job.is_api ? "Open API" : "Open app"));
       preview.addEventListener("click", (event) => {
         event.preventDefault();
         openExternal(job.preview_url);
       });
       actions.append(preview);
+
+      actions.append(actionButton("Copy link", "copy", "ghost", () => copyLink(job.preview_url)));
     }
 
     if (job.status === "running") {
-      const termBtn = document.createElement("button");
-      termBtn.textContent = "Terminal";
-      termBtn.addEventListener("click", () => openTerminal(job));
-      actions.append(termBtn);
+      actions.append(actionButton("Terminal", "terminal", "", () => openTerminal(job)));
     }
 
-    const logsBtn = document.createElement("button");
-    logsBtn.className = "ghost";
-    logsBtn.textContent = "Logs";
-    logsBtn.addEventListener("click", () => toggleLogs(job, card));
-    actions.append(logsBtn);
+    actions.append(actionButton("Logs", "logs", "ghost", () => toggleLogs(job, card)));
 
     if (!["stopped", "failed", "expired"].includes(job.status)) {
-      const stopBtn = document.createElement("button");
-      stopBtn.className = "danger";
-      stopBtn.textContent = "Stop";
-      stopBtn.addEventListener("click", () => stopJob(job.id));
-      actions.append(stopBtn);
+      actions.append(actionButton("Stop", "stop", "danger", () => stopJob(job.id)));
     }
 
-    card.append(head, meta, actions);
-    if (job.status === "running" && job.metrics) {
-      card.append(renderMetrics(job.metrics));
-    }
+    card.append(actions);
     container.append(card);
   });
 }
@@ -180,6 +285,13 @@ async function loadJobs() {
   }
 }
 
+function setRunning(busy) {
+  const button = $("run-btn");
+  button.disabled = busy;
+  button.classList.toggle("busy", busy);
+  button.querySelector(".btn-label").textContent = busy ? "Starting..." : "Run repository";
+}
+
 async function runJob() {
   const repoUrl = $("repo-url").value.trim();
   const branch = $("repo-branch").value.trim();
@@ -187,8 +299,7 @@ async function runJob() {
     setMsg($("form-msg"), "Enter a GitHub repository URL.", true);
     return;
   }
-  const button = $("run-btn");
-  button.disabled = true;
+  setRunning(true);
   setMsg($("form-msg"), "Queueing...");
   try {
     await api("/api/jobs", {
@@ -196,19 +307,21 @@ async function runJob() {
       body: JSON.stringify({ repo_url: repoUrl, branch: branch || null }),
     });
     setMsg($("form-msg"), "Job queued. Watch the status below.");
+    toast("Job queued", "ok");
     $("repo-url").value = "";
     $("repo-branch").value = "";
     await loadJobs();
   } catch (err) {
     setMsg($("form-msg"), err.message, true);
   } finally {
-    button.disabled = false;
+    setRunning(false);
   }
 }
 
 async function stopJob(jobId) {
   try {
     await api("/api/jobs/" + jobId + "/stop", { method: "POST" });
+    toast("Job stopped", "ok");
     await loadJobs();
   } catch (err) {
     setMsg($("form-msg"), err.message, true);
@@ -225,8 +338,6 @@ async function toggleLogs(job, card) {
     const data = await api("/api/jobs/" + job.id);
     const pre = document.createElement("pre");
     pre.className = "log";
-    pre.style.cssText =
-      "max-height:240px;overflow:auto;background:#0b0e13;padding:8px;border-radius:8px;font-size:12px;white-space:pre-wrap;";
     pre.textContent = data.job.log_tail || "(no output yet)";
     card.append(pre);
   } catch (err) {
@@ -240,12 +351,13 @@ function ensureTerminal() {
     convertEol: true,
     fontSize: 13,
     scrollback: 3000,
-    theme: { background: "#0b0e13", foreground: "#e6e9ef", cursor: "#3b82f6" },
+    cursorBlink: true,
+    theme: { background: "#080b11", foreground: "#e8ecf4", cursor: "#4f8cff" },
   });
   fitAddon = new FitAddon.FitAddon();
   term.loadAddon(fitAddon);
   term.open($("terminal"));
-  setTimeout(() => fitAddon.fit(), 50);
+  setTimeout(() => fitAddon.fit(), 60);
   term.onData((data) => {
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(new TextEncoder().encode(data));
@@ -254,7 +366,7 @@ function ensureTerminal() {
 }
 
 function sendResize() {
-  if (!term || !fitAddon) return;
+  if (!term || !fitAddon || $("terminal-panel").hidden) return;
   fitAddon.fit();
   if (socket && socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify({ type: "resize", rows: term.rows, cols: term.cols }));
@@ -313,9 +425,21 @@ async function boot() {
     return;
   }
   $("run-btn").addEventListener("click", runJob);
-  $("refresh-btn").addEventListener("click", loadJobs);
+  $("refresh-btn").addEventListener("click", async () => {
+    await loadJobs();
+    toast("Refreshed");
+  });
   $("terminal-close").addEventListener("click", closeTerminal);
+  $("terminal-panel").querySelector("[data-close]").addEventListener("click", closeTerminal);
+  document.querySelectorAll("#repo-url, #repo-branch").forEach((input) => {
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") runJob();
+    });
+  });
   window.addEventListener("resize", sendResize);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) loadJobs();
+  });
   await loadJobs();
   startPolling();
 }
