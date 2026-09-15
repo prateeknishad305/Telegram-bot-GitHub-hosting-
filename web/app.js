@@ -2,8 +2,8 @@ const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : 
 if (tg) {
   tg.ready();
   tg.expand();
-  if (tg.setHeaderColor) tg.setHeaderColor("#0b0f17");
-  if (tg.setBackgroundColor) tg.setBackgroundColor("#0b0f17");
+  if (tg.setHeaderColor) tg.setHeaderColor("#1c1c1c");
+  if (tg.setBackgroundColor) tg.setBackgroundColor("#0b1424");
 }
 
 const $ = (id) => document.getElementById(id);
@@ -48,6 +48,43 @@ function toast(text, kind) {
   toastTimer = setTimeout(() => {
     el.hidden = true;
   }, 2600);
+}
+
+function startClock() {
+  const el = $("clock");
+  const tick = () => {
+    const now = new Date();
+    const date = now.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" });
+    const time = now.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+    el.textContent = date + "  " + time;
+    el.title = now.toLocaleString();
+  };
+  tick();
+  setInterval(tick, 15000);
+}
+
+function setupWindowControls() {
+  document.querySelectorAll("[data-action]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const win = button.closest(".window");
+      if (!win) return;
+      const action = button.dataset.action;
+      if (action === "collapse") return win.classList.toggle("collapsed");
+      if (action === "max") return win.classList.toggle("maxed");
+      if (action === "close") {
+        if (win.id === "terminal-panel") return closeTerminal();
+        return win.classList.toggle("collapsed");
+      }
+    });
+  });
+
+  document.querySelectorAll(".titlebar").forEach((bar) => {
+    bar.addEventListener("click", () => {
+      const win = bar.closest(".window");
+      if (win && win.classList.contains("collapsed")) win.classList.remove("collapsed");
+    });
+  });
 }
 
 async function authenticate() {
@@ -185,7 +222,7 @@ function renderEmpty() {
   box.className = "empty";
   box.append(icon("inbox"));
   const line1 = document.createElement("span");
-  line1.textContent = "No jobs yet";
+  line1.textContent = "No jobs in this folder";
   const line2 = document.createElement("span");
   line2.textContent = "Paste a GitHub repo above and hit Run to start one.";
   box.append(line1, line2);
@@ -218,9 +255,7 @@ function renderJobs(jobs) {
     const sub = document.createElement("div");
     sub.className = "sub";
     sub.textContent =
-      (job.branch ? job.branch + " - " : "") +
-      timeAgo(job.created_at) +
-      (job.is_api ? " - API" : "");
+      (job.branch ? job.branch + " - " : "") + timeAgo(job.created_at) + (job.is_api ? " - API" : "");
     titleWrap.append(repo, sub);
 
     const badge = document.createElement("span");
@@ -350,9 +385,10 @@ function ensureTerminal() {
   term = new Terminal({
     convertEol: true,
     fontSize: 13,
+    fontFamily: '"DejaVu Sans Mono", "Liberation Mono", monospace',
     scrollback: 3000,
     cursorBlink: true,
-    theme: { background: "#080b11", foreground: "#e8ecf4", cursor: "#4f8cff" },
+    theme: { background: "#1d1d20", foreground: "#d8dbdf", cursor: "#f0f0f0" },
   });
   fitAddon = new FitAddon.FitAddon();
   term.loadAddon(fitAddon);
@@ -375,7 +411,7 @@ function sendResize() {
 
 function openTerminal(job) {
   $("terminal-panel").hidden = false;
-  $("terminal-title").textContent = "Terminal - " + job.repo_full_name;
+  $("terminal-title").textContent = job.repo_full_name + " - Terminal";
   setMsg($("terminal-msg"), "");
   ensureTerminal();
   term.clear();
@@ -407,6 +443,7 @@ function closeTerminal() {
     socket = null;
   }
   $("terminal-panel").hidden = true;
+  $("terminal-panel").classList.remove("collapsed");
   activeJobId = null;
 }
 
@@ -418,6 +455,8 @@ function startPolling() {
 }
 
 async function boot() {
+  startClock();
+  setupWindowControls();
   try {
     await authenticate();
   } catch (err) {

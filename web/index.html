@@ -3,83 +3,141 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="theme-color" content="#0b0f17" />
+    <meta name="theme-color" content="#1c1c1c" />
     <title>Repo Runner</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
     <link rel="stylesheet" href="/static/styles.css" />
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
   </head>
   <body>
-    <div class="aurora" aria-hidden="true"></div>
+    <div class="desktop-wallpaper" aria-hidden="true">
+      <svg class="swirl" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="0.55" stroke-linecap="round">
+        <path d="M21.9 12.9A9.9 9.9 0 1 1 12.4 2.1" />
+        <path d="M12.4 2.1A6.6 6.6 0 0 0 5.7 12" />
+        <path d="M5.7 12A3.6 3.6 0 0 0 9.3 15.6" />
+      </svg>
+    </div>
 
-    <header class="appbar">
-      <div class="brand">
-        <span class="brand-logo" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="3" y="4" width="18" height="16" rx="4" />
-            <path d="m8 10 2.5 2.5L8 15" />
-            <path d="M13.5 15H17" />
-          </svg>
-        </span>
-        <span class="brand-text">
-          <strong>Repo Runner</strong>
-          <small>GitHub deploy sandbox</small>
+    <div class="panel">
+      <div class="panel-left">
+        <button class="panel-item" type="button">Activities</button>
+        <span class="panel-app">
+          <span class="panel-app-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="0.7" stroke-linecap="round">
+              <path d="M21.9 12.9A9.9 9.9 0 1 1 12.4 2.1" />
+              <path d="M12.4 2.1A6.6 6.6 0 0 0 5.7 12" />
+              <path d="M5.7 12A3.6 3.6 0 0 0 9.3 15.6" />
+            </svg>
+          </span>
+          <span class="panel-app-name">Repo Runner</span>
         </span>
       </div>
-      <span id="who" class="user-chip" hidden></span>
-    </header>
+      <div class="panel-center">
+        <span id="clock" class="panel-clock">--:--</span>
+      </div>
+      <div class="panel-right">
+        <span id="who" class="panel-user" hidden></span>
+        <span class="panel-status" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M5 12.5 9.5 17 19 7" />
+          </svg>
+        </span>
+      </div>
+    </div>
 
-    <main>
-      <section class="card form-card">
-        <div class="card-head">
-          <h2>Run a repository</h2>
+    <main class="desktop">
+      <section class="window">
+        <header class="titlebar">
+          <span class="titlebar-title">Run a repository</span>
+          <span class="window-controls">
+            <button class="wctl" type="button" data-action="collapse" title="Minimize" aria-label="Minimize">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 12h12" /></svg>
+            </button>
+            <button class="wctl" type="button" data-action="max" title="Maximize" aria-label="Maximize">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><rect x="6.5" y="6.5" width="11" height="11" rx="1.5" /></svg>
+            </button>
+            <button class="wctl close" type="button" data-action="close" title="Close" aria-label="Close">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"><path d="M7 7l10 10M17 7 7 17" /></svg>
+            </button>
+          </span>
+        </header>
+        <div class="window-body">
+          <label class="field">
+            <span class="field-label">Repository URL</span>
+            <input id="repo-url" type="text" inputmode="url" autocomplete="off" spellcheck="false"
+                   placeholder="https://github.com/owner/repo" />
+          </label>
+          <label class="field">
+            <span class="field-label">Branch <span class="dim">(optional)</span></span>
+            <input id="repo-branch" type="text" autocomplete="off" spellcheck="false"
+                   placeholder="default branch" />
+          </label>
+          <button id="run-btn" class="btn primary">
+            <span class="spinner" aria-hidden="true"></span>
+            <span class="btn-label">Run repository</span>
+          </button>
+          <p id="form-msg" class="msg"></p>
         </div>
-        <label class="field">
-          <span class="field-label">Repository URL</span>
-          <input id="repo-url" type="text" inputmode="url" autocomplete="off" spellcheck="false"
-                 placeholder="https://github.com/owner/repo" />
-        </label>
-        <label class="field">
-          <span class="field-label">Branch <em>optional</em></span>
-          <input id="repo-branch" type="text" autocomplete="off" spellcheck="false"
-                 placeholder="default branch" />
-        </label>
-        <button id="run-btn" class="btn primary">
-          <span class="spinner" aria-hidden="true"></span>
-          <span class="btn-label">Run repository</span>
-        </button>
-        <p id="form-msg" class="msg"></p>
       </section>
 
-      <section class="card jobs-card">
-        <div class="card-head">
-          <h2>Your jobs<span id="job-count" class="count"></span></h2>
-          <button id="refresh-btn" class="btn icon ghost" title="Refresh" aria-label="Refresh">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 12a9 9 0 1 1-2.64-6.36" />
-              <path d="M21 3v6h-6" />
-            </svg>
-          </button>
+      <section class="window">
+        <header class="titlebar">
+          <span class="titlebar-title">Your jobs<span id="job-count" class="count"></span></span>
+          <span class="window-controls">
+            <button class="wctl" type="button" data-action="collapse" title="Minimize" aria-label="Minimize">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 12h12" /></svg>
+            </button>
+            <button id="refresh-btn" class="wctl" type="button" title="Refresh" aria-label="Refresh">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                <path d="M21 3v6h-6" />
+              </svg>
+            </button>
+            <button class="wctl close" type="button" data-action="close" title="Close" aria-label="Close">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"><path d="M7 7l10 10M17 7 7 17" /></svg>
+            </button>
+          </span>
+        </header>
+        <div class="window-body">
+          <div class="view-header">
+            <span class="pathbar">
+              <span class="pathbar-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h3l2 2h8A2.5 2.5 0 0 1 21 9.5v7A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z" /></svg>
+              </span>
+              <span class="pathbar-text">Home</span>
+              <span class="pathbar-sep">/</span>
+              <span class="pathbar-text">Jobs</span>
+            </span>
+          </div>
+          <div id="jobs" class="jobs"></div>
         </div>
-        <div id="jobs" class="jobs"></div>
       </section>
     </main>
 
-    <div id="terminal-panel" class="sheet" hidden>
-      <div class="sheet-backdrop" data-close></div>
-      <div class="sheet-body">
-        <div class="sheet-grip" aria-hidden="true"></div>
-        <div class="sheet-head">
-          <h2 id="terminal-title">Terminal</h2>
-          <button id="terminal-close" class="btn icon ghost" title="Close" aria-label="Close">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M6 6l12 12M18 6 6 18" />
-            </svg>
-          </button>
+    <div id="terminal-panel" class="window overlay" hidden>
+      <div class="window-backdrop" data-close></div>
+      <section class="window-frame">
+        <header class="titlebar">
+          <span class="titlebar-title">
+            <span class="term-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3" /><path d="m8 10 2.5 2.5L8 15" /><path d="M13.5 15H17" /></svg>
+            </span>
+            <span id="terminal-title">Terminal</span>
+          </span>
+          <span class="window-controls">
+            <button class="wctl" type="button" data-action="collapse" title="Minimize" aria-label="Minimize">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 12h12" /></svg>
+            </button>
+            <button id="terminal-close" class="wctl close" type="button" title="Close" aria-label="Close">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"><path d="M7 7l10 10M17 7 7 17" /></svg>
+            </button>
+          </span>
+        </header>
+        <div class="window-body terminal-body">
+          <div id="terminal"></div>
+          <p id="terminal-msg" class="msg"></p>
         </div>
-        <div id="terminal"></div>
-        <p id="terminal-msg" class="msg"></p>
-      </div>
+      </section>
     </div>
 
     <div id="toast" class="toast" hidden></div>
