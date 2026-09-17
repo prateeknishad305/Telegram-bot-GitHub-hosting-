@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from telegram import Update
 from telegram.ext import Application, ApplicationBuilder, CommandHandler
@@ -11,7 +12,10 @@ from .db import Database
 from .docker_runner import DockerRunner, DockerRunnerError
 from .handlers import (
     cmd_api,
+    cmd_cancel,
+    cmd_download,
     cmd_help,
+    cmd_info,
     cmd_jobs,
     cmd_logs,
     cmd_open,
@@ -22,6 +26,7 @@ from .handlers import (
     on_error,
 )
 from .jobs import JobManager
+from .maintenance import MaintenanceLoop
 from .monitor import ApiMonitor
 from .webapp import WebServer
 
@@ -49,9 +54,10 @@ async def post_init(application: Application) -> None:
     db = Database(settings.db_path)
     await db.connect()
 
-    runner = DockerRunner(settings.docker_network)
+    runner = DockerRunner(settings.docker_network, settings.resolved_docker_host())
     try:
         await asyncio.to_thread(runner.ensure_network)
+        logger.info("Using Docker daemon at %s", runner.docker_host)
     except DockerRunnerError as exc:
         logger.warning("Docker is not ready yet: %s", exc)
 
@@ -62,17 +68,46 @@ async def post_init(application: Application) -> None:
     await monitor.start()
 
     manager = JobManager(settings, db, runner, notify, monitor)
-    server = WebServer(settings, db, manager, runner, monitor)
+    recovered = await manager.recover_stale_jobs()
+    if recovered:
+        logger.info("Recovered %s stale job(s) from a previous run", recovered)
+
+    maintenance = MaintenanceLoop(settings, db)
+    await maintenance.start()
+
+    server = WebServer(settings, db, manager, runner, monitor, maintenance)
     await server.start()
 
-    application.bot_data.update(db=db, runner=runner, manager=manager, server=server, monitor=monitor)
+    application.bot_data.update(
+        db=db,
+        runner=runner,
+        manager=manager,
+        server=server,
+        monitor=monitor,
+        maintenance=maintenance,
+    )
+    asyncio.create_task(_restart_watcher(application), name="restart-watcher")
     logger.info("Mini App and runner API listening on %s:%s", settings.web_host, settings.web_port)
+
+
+async def _restart_watcher(application: Application) -> None:
+    """Exit the process when maintenance asks for a restart and a supervisor is present."""
+    maintenance: MaintenanceLoop = application.bot_data["maintenance"]
+    while True:
+        await asyncio.sleep(30)
+        if maintenance.restart_requested:
+            logger.error("Disk still full after cleanup; exiting so the supervisor restarts the bot")
+            asyncio.get_running_loop().call_later(1, os._exit, 1)
+            return
 
 
 async def post_shutdown(application: Application) -> None:
     manager: JobManager | None = application.bot_data.get("manager")
     if manager is not None:
         await manager.shutdown()
+    maintenance: MaintenanceLoop | None = application.bot_data.get("maintenance")
+    if maintenance is not None:
+        await maintenance.stop()
     server: WebServer | None = application.bot_data.get("server")
     if server is not None:
         await server.stop()
@@ -98,9 +133,12 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("run", cmd_run))
+    application.add_handler(CommandHandler("cancel", cmd_cancel))
     application.add_handler(CommandHandler("jobs", cmd_jobs))
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("api", cmd_api))
+    application.add_handler(CommandHandler("download", cmd_download))
+    application.add_handler(CommandHandler("info", cmd_info))
     application.add_handler(CommandHandler("logs", cmd_logs))
     application.add_handler(CommandHandler("stop", cmd_stop))
     application.add_handler(CommandHandler("open", cmd_open))

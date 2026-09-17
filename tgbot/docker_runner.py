@@ -6,24 +6,33 @@ from pathlib import Path
 import docker
 from docker.errors import APIError, DockerException, NotFound
 
+from .config import discover_docker_host
+
 
 class DockerRunnerError(RuntimeError):
     pass
 
 
 class DockerRunner:
-    def __init__(self, network: str):
+    def __init__(self, network: str, docker_host: str | None = None):
         self.network = network
+        self.docker_host = discover_docker_host(docker_host)
         self._client: docker.DockerClient | None = None
 
     @property
     def client(self) -> docker.DockerClient:
         if self._client is None:
             try:
-                self._client = docker.from_env()
+                self._client = docker.DockerClient(base_url=self.docker_host)
                 self._client.ping()
             except DockerException as exc:
-                raise DockerRunnerError(f"Cannot connect to the Docker daemon: {exc}") from exc
+                raise DockerRunnerError(
+                    f"Cannot connect to the Docker daemon at {self.docker_host}: {exc}\n"
+                    "If you run rootless Docker or Podman, start the user service and point "
+                    "DOCKER_HOST at its socket, for example "
+                    "DOCKER_HOST=unix:///run/user/$(id -u)/docker.sock "
+                    "or DOCKER_HOST=unix:///run/user/$(id -u)/podman/podman.sock."
+                ) from exc
         return self._client
 
     def ensure_network(self) -> None:
@@ -179,6 +188,21 @@ class DockerRunner:
             self.client.images.remove(image=tag, force=True)
         except (NotFound, APIError):
             return
+
+    def stop_orphans(self) -> int:
+        """Stop leftover job containers after a bot restart."""
+        try:
+            containers = self.client.containers.list(all=True, filters={"label": "tgbot.runner=1"})
+        except (APIError, DockerException):
+            return 0
+        stopped = 0
+        for container in containers:
+            try:
+                container.remove(force=True, v=True)
+                stopped += 1
+            except (APIError, NotFound):
+                continue
+        return stopped
 
     @staticmethod
     def find_free_port(start: int, end: int, used: set[int] | None = None) -> int:

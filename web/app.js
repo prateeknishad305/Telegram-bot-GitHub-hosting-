@@ -124,8 +124,22 @@ function renderJobs(jobs) {
       "job " +
       job.id +
       (job.app_port ? " - port " + job.app_port : "") +
+      (job.requested_port ? " (requested " + job.requested_port + ")" : "") +
       (job.run_command ? " - " + job.run_command : "") +
       (job.error ? " - " + String(job.error).slice(0, 120) : "");
+
+    if (job.status === "building") {
+      const build = document.createElement("div");
+      build.className = "meta";
+      const steps = job.build_total_steps
+        ? job.build_step + "/" + job.build_total_steps
+        : String(job.build_step || 0);
+      build.textContent =
+        "building: step " +
+        steps +
+        (job.build_eta_seconds != null ? " - ETA " + formatDuration(job.build_eta_seconds) : "");
+      meta.append(build);
+    }
 
     const actions = document.createElement("div");
     actions.className = "actions";
@@ -147,6 +161,18 @@ function renderJobs(jobs) {
       termBtn.textContent = "Terminal";
       termBtn.addEventListener("click", () => openTerminal(job));
       actions.append(termBtn);
+    }
+
+    if (job.download_url) {
+      const dlBtn = document.createElement("a");
+      dlBtn.className = "ghost";
+      dlBtn.href = job.download_url;
+      dlBtn.textContent = "Download zip";
+      dlBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        openExternal(job.download_url);
+      });
+      actions.append(dlBtn);
     }
 
     const logsBtn = document.createElement("button");
@@ -180,11 +206,41 @@ async function loadJobs() {
   }
 }
 
+function fmtBytes(num) {
+  let value = Math.max(0, Number(num) || 0);
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (value >= 1024 && i < units.length - 1) {
+    value /= 1024;
+    i += 1;
+  }
+  return (i === 0 ? value : value.toFixed(1)) + " " + units[i];
+}
+
+async function loadInfo() {
+  try {
+    const info = await api("/api/info");
+    const disk = info.disk || {};
+    const m = info.maintenance || {};
+    const rows = [
+      "Disk: " + (disk.percent != null ? disk.percent + "% used" : "?") +
+        " (" + (info.disk_human ? info.disk_human.free + " free of " + info.disk_human.total : "") + ")",
+      "Cache: " + (m.cache_human || "-") + ", cleaned every " +
+        Math.round((m.cleanup_interval_seconds || 0) / 3600) + "h",
+      "Active jobs: " + (info.active_jobs || 0) + " / " + (info.max_concurrent_jobs || 0),
+    ];
+    $("info").textContent = rows.join("  |  ");
+  } catch (err) {
+    $("info").textContent = "info unavailable: " + err.message;
+  }
+}
+
 async function runJob() {
   const repoUrl = $("repo-url").value.trim();
   const branch = $("repo-branch").value.trim();
+  const port = $("repo-port").value.trim();
   if (!repoUrl) {
-    setMsg($("form-msg"), "Enter a GitHub repository URL.", true);
+    setMsg($("form-msg"), "Enter a GitHub repository or release archive URL.", true);
     return;
   }
   const button = $("run-btn");
@@ -193,12 +249,14 @@ async function runJob() {
   try {
     await api("/api/jobs", {
       method: "POST",
-      body: JSON.stringify({ repo_url: repoUrl, branch: branch || null }),
+      body: JSON.stringify({ repo_url: repoUrl, branch: branch || null, port: port || null }),
     });
     setMsg($("form-msg"), "Job queued. Watch the status below.");
     $("repo-url").value = "";
     $("repo-branch").value = "";
+    $("repo-port").value = "";
     await loadJobs();
+    await loadInfo();
   } catch (err) {
     setMsg($("form-msg"), err.message, true);
   } finally {
@@ -301,7 +359,10 @@ function closeTerminal() {
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(() => {
-    if (!document.hidden) loadJobs();
+    if (!document.hidden) {
+      loadJobs();
+      loadInfo();
+    }
   }, 5000);
 }
 
@@ -314,9 +375,11 @@ async function boot() {
   }
   $("run-btn").addEventListener("click", runJob);
   $("refresh-btn").addEventListener("click", loadJobs);
+  $("info-btn").addEventListener("click", loadInfo);
   $("terminal-close").addEventListener("click", closeTerminal);
   window.addEventListener("resize", sendResize);
   await loadJobs();
+  await loadInfo();
   startPolling();
 }
 

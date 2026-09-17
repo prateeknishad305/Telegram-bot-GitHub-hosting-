@@ -16,11 +16,20 @@
 
     <main>
       <section class="card">
-        <h2>Run a repository</h2>
-        <input id="repo-url" type="text" inputmode="url" placeholder="https://github.com/owner/repo" />
-        <input id="repo-branch" type="text" placeholder="branch (optional)" />
+        <h2>Run a repository or release</h2>
+        <input id="repo-url" type="text" inputmode="url" placeholder="https://github.com/owner/repo or a release .zip" />
+        <input id="repo-branch" type="text" placeholder="branch (optional, git only)" />
+        <input id="repo-port" type="number" min="1024" max="65535" placeholder="port the app needs (optional)" />
         <button id="run-btn" class="primary">Run</button>
         <p id="form-msg" class="msg"></p>
+      </section>
+
+      <section class="card">
+        <div class="row">
+          <h2>Bot info</h2>
+          <button id="info-btn" class="ghost">Refresh info</button>
+        </div>
+        <div id="info" class="info"></div>
       </section>
 
       <section class="card">

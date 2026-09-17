@@ -64,6 +64,32 @@ class Job:
     expires_at: float | None = None
     is_api: bool = False
     health_path: str | None = None
+    source_kind: str = "git"
+    release_tag: str | None = None
+    archive_name: str | None = None
+    archive_path: str | None = None
+    requested_port: int | None = None
+    build_started_at: float | None = None
+    build_total_steps: int = 0
+    build_step: int = 0
+
+    @property
+    def has_archive(self) -> bool:
+        return bool(self.archive_path)
+
+    @property
+    def build_eta_seconds(self) -> float | None:
+        """Estimated seconds left for the current build, based on step timing."""
+        if (
+            not self.build_started_at
+            or not self.build_total_steps
+            or self.build_step <= 0
+        ):
+            return None
+        elapsed = max(0.0, time.time() - self.build_started_at)
+        per_step = elapsed / self.build_step
+        remaining = max(0, self.build_total_steps - self.build_step)
+        return per_step * remaining
 
     def as_dict(self) -> dict:
         return {
@@ -89,4 +115,13 @@ class Job:
             "expires_at": self.expires_at,
             "is_api": self.is_api,
             "health_path": self.health_path,
+            "source_kind": self.source_kind,
+            "release_tag": self.release_tag,
+            "archive_name": self.archive_name,
+            "archive_path": self.archive_path,
+            "has_archive": self.has_archive,
+            "requested_port": self.requested_port,
+            "build_total_steps": self.build_total_steps,
+            "build_step": self.build_step,
+            "build_eta_seconds": self.build_eta_seconds,
         }

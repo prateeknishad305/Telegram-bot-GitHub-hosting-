@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import aiosqlite
@@ -29,7 +30,15 @@ CREATE TABLE IF NOT EXISTS jobs (
     log_path TEXT,
     expires_at REAL,
     is_api INTEGER DEFAULT 0,
-    health_path TEXT
+    health_path TEXT,
+    source_kind TEXT DEFAULT 'git',
+    release_tag TEXT,
+    archive_name TEXT,
+    archive_path TEXT,
+    requested_port INTEGER,
+    build_started_at REAL,
+    build_total_steps INTEGER DEFAULT 0,
+    build_step INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
@@ -63,11 +72,27 @@ _COLUMNS = [
     "expires_at",
     "is_api",
     "health_path",
+    "source_kind",
+    "release_tag",
+    "archive_name",
+    "archive_path",
+    "requested_port",
+    "build_started_at",
+    "build_total_steps",
+    "build_step",
 ]
 
 _MIGRATION_COLUMNS = {
     "is_api": "INTEGER DEFAULT 0",
     "health_path": "TEXT",
+    "source_kind": "TEXT DEFAULT 'git'",
+    "release_tag": "TEXT",
+    "archive_name": "TEXT",
+    "archive_path": "TEXT",
+    "requested_port": "INTEGER",
+    "build_started_at": "REAL",
+    "build_total_steps": "INTEGER DEFAULT 0",
+    "build_step": "INTEGER DEFAULT 0",
 }
 
 
@@ -164,6 +189,31 @@ class Database:
         await cursor.close()
         return int(row[0]) if row else 0
 
+    async def fail_stale_jobs(self, reason: str) -> int:
+        """Close jobs left active by a previous run.
+
+        Queued/cloning/building jobs cannot resume after a restart, so they
+        would otherwise stay "queued" forever and block a concurrency slot.
+        Running jobs are marked stopped because their container is gone.
+        """
+        now = time.time()
+        unfinished = [JobStatus.QUEUED, JobStatus.CLONING, JobStatus.BUILDING]
+        marks = ", ".join("?" for _ in unfinished)
+        cursor = await self.conn.execute(
+            f"UPDATE jobs SET status = ?, error = ?, updated_at = ? WHERE status IN ({marks})",
+            [JobStatus.FAILED.value, reason, now, *[s.value for s in unfinished]],
+        )
+        failed = cursor.rowcount or 0
+        await cursor.close()
+        cursor = await self.conn.execute(
+            "UPDATE jobs SET status = ?, error = ?, updated_at = ? WHERE status = ?",
+            [JobStatus.STOPPED.value, reason, now, JobStatus.RUNNING.value],
+        )
+        stopped = cursor.rowcount or 0
+        await cursor.close()
+        await self.conn.commit()
+        return failed + stopped
+
     async def save_metrics(self, job_id: str, data: str, updated_at: float) -> None:
         await self.conn.execute(
             "INSERT INTO metrics (job_id, data, updated_at) VALUES (?, ?, ?) "
@@ -182,4 +232,6 @@ class Database:
 def _row_to_job(row: aiosqlite.Row) -> Job:
     data = {key: row[key] for key in row}
     data["status"] = JobStatus(data["status"])
+    if not data.get("source_kind"):
+        data["source_kind"] = "git"
     return Job(**data)

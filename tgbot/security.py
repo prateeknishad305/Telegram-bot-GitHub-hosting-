@@ -17,6 +17,25 @@ _REPO_RE = re.compile(
 )
 _SHORTHAND_RE = re.compile(r"^([A-Za-z0-9_.-]{1,39})/([A-Za-z0-9_.-]{1,100})$")
 
+ARCHIVE_SUFFIXES = (".zip", ".tar.gz", ".tgz", ".tar", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")
+
+_OWNER = r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,38})"
+_REPO = r"[A-Za-z0-9_.-]{1,100}?"
+
+_RELEASE_ASSET_RE = re.compile(
+    rf"^(?:https?://)?(?:www\.)?github\.com/(?P<owner>{_OWNER})/(?P<name>{_REPO})"
+    r"/releases/download/(?P<tag>[^/\s?#]+)/(?P<asset>[^/\s?#]+)$",
+    re.IGNORECASE,
+)
+
+_ARCHIVE_REF_RE = re.compile(
+    rf"^(?:https?://)?(?:www\.)?github\.com/(?P<owner>{_OWNER})/(?P<name>{_REPO})"
+    r"/archive/refs/(?P<kind>tags|heads)/(?P<ref>[^/\s?#]+?)(?P<suffix>"
+    + "|".join(re.escape(suffix) for suffix in ARCHIVE_SUFFIXES)
+    + r")$",
+    re.IGNORECASE,
+)
+
 _SECRET_PATTERNS = [
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
     re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
@@ -37,6 +56,106 @@ class RepoRef:
     @property
     def clone_url(self) -> str:
         return f"https://{GITHUB_HOST}/{self.full_name}.git"
+
+
+@dataclass(frozen=True)
+class SourceRef:
+    """A runnable source: either a git repository or a release archive."""
+
+    kind: str
+    owner: str
+    name: str
+    full_name: str
+    tag: str | None = None
+    asset: str | None = None
+    url: str | None = None
+
+    @property
+    def clone_url(self) -> str:
+        return f"https://{GITHUB_HOST}/{self.full_name}.git"
+
+    @property
+    def is_archive(self) -> bool:
+        return self.kind == "archive"
+
+    @property
+    def release_url(self) -> str | None:
+        if self.tag:
+            return f"https://{GITHUB_HOST}/{self.full_name}/releases/tag/{self.tag}"
+        return None
+
+
+def archive_suffix(name: str) -> str | None:
+    lowered = name.lower()
+    for suffix in ARCHIVE_SUFFIXES:
+        if lowered.endswith(suffix):
+            return suffix
+    return None
+
+
+def _validate_release_part(value: str, label: str) -> str:
+    value = value.strip()
+    if not value or value in {".", ".."}:
+        raise ValidationError(f"Invalid {label}")
+    if "/" in value or "\\" in value or "\x00" in value:
+        raise ValidationError(f"Invalid {label}")
+    return value
+
+
+def _parse_archive_url(raw: str) -> SourceRef | None:
+    match = _RELEASE_ASSET_RE.match(raw)
+    if match:
+        asset = _validate_release_part(match.group("asset"), "release asset")
+        if archive_suffix(asset) is None:
+            raise ValidationError(
+                "Release assets must be .zip, .tar.gz, .tgz or .tar archives; "
+                "other assets (binaries, installers, checksums) cannot be run"
+            )
+        return SourceRef(
+            kind="archive",
+            owner=match.group("owner"),
+            name=match.group("name").removesuffix(".git"),
+            full_name=f"{match.group('owner')}/{match.group('name').removesuffix('.git')}",
+            tag=_validate_release_part(match.group("tag"), "release tag"),
+            asset=asset,
+            url=f"https://{GITHUB_HOST}/{match.group('owner')}/{match.group('name').removesuffix('.git')}"
+            f"/releases/download/{match.group('tag')}/{asset}",
+        )
+
+    ref_match = _ARCHIVE_REF_RE.match(raw)
+    if ref_match:
+        name = ref_match.group("name").removesuffix(".git")
+        ref = _validate_release_part(ref_match.group("ref"), "archive ref")
+        return SourceRef(
+            kind="archive",
+            owner=ref_match.group("owner"),
+            name=name,
+            full_name=f"{ref_match.group('owner')}/{name}",
+            tag=ref,
+            asset=f"{name}-{ref}{ref_match.group('suffix')}",
+            url=f"https://{GITHUB_HOST}/{ref_match.group('owner')}/{name}"
+            f"/archive/refs/{ref_match.group('kind')}/{ref}{ref_match.group('suffix')}",
+        )
+
+    if archive_suffix(raw.split("?", 1)[0]) is not None and "github.com" not in raw.lower():
+        raise ValidationError(
+            "Only github.com archive URLs are supported, e.g. "
+            "https://github.com/owner/repo/releases/download/v1.0/app.zip"
+        )
+    return None
+
+
+def parse_source(raw: str) -> SourceRef:
+    value = (raw or "").strip()
+    if not value:
+        raise ValidationError("Repository URL is empty")
+
+    archive = _parse_archive_url(value)
+    if archive is not None:
+        return archive
+
+    repo = parse_repo_url(value)
+    return SourceRef(kind="git", owner=repo.owner, name=repo.name, full_name=repo.full_name)
 
 
 def parse_repo_url(raw: str) -> RepoRef:
@@ -69,7 +188,7 @@ def parse_repo_url(raw: str) -> RepoRef:
     return RepoRef(owner=owner, name=name, full_name=f"{owner}/{name}")
 
 
-def check_owner_allowed(repo: RepoRef, allowed_owners: set[str]) -> None:
+def check_owner_allowed(repo: RepoRef | SourceRef, allowed_owners: set[str]) -> None:
     if not allowed_owners:
         return
     if repo.owner.lower() not in allowed_owners:
@@ -88,6 +207,18 @@ def validate_branch(branch: str | None) -> str | None:
     if len(branch) > 100 or branch.startswith("-") or not re.match(r"^[A-Za-z0-9._/\-]+$", branch):
         raise ValidationError("Invalid branch name")
     return branch
+
+
+def validate_port(port: int | str | None) -> int | None:
+    if port is None or port == "":
+        return None
+    try:
+        value = int(port)
+    except (TypeError, ValueError):
+        raise ValidationError("Port must be a number between 1024 and 65535") from None
+    if not 1024 <= value <= 65535:
+        raise ValidationError("Port must be between 1024 and 65535")
+    return value
 
 
 def redact_secrets(text: str) -> str:

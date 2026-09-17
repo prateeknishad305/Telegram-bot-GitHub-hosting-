@@ -95,6 +95,106 @@ Caddyfile         reverse proxy with automatic HTTPS
 
 5. Talk to your bot with `/run https://github.com/owner/repo`.
 
+   Release archives work the same way:
+
+   ```text
+   /run https://github.com/owner/repo/releases/download/v1.0/app.zip
+   /run https://github.com/owner/repo main 8080
+   ```
+
+   If the app needs a specific port, pass it as the last argument. During the
+   Docker build the bot reports the current step and an ETA. Use `/cancel <job_id>`
+   to abort a queued, building or running job.
+
+   The Mini App terminal is a Linux shell inside the running container. From
+   there you can start extra processes, inspect files, or host the app yourself.
+
+## Release archives (zip / tar.gz)
+
+`/run` accepts GitHub release asset URLs and GitHub archive URLs:
+
+```text
+https://github.com/owner/repo/releases/download/v1.0/app.zip
+https://github.com/owner/repo/archive/refs/tags/v1.0.tar.gz
+```
+
+The bot downloads the archive (GitHub hosts only), extracts it with zip-slip
+protection, runs the same stack detector as a git clone, and hosts the original
+file at `/download/<job_id>`. Telegram users can also use `/download <job_id>`.
+Limits are `ARCHIVE_MAX_BYTES` (download) and `ARCHIVE_EXTRACT_MAX_BYTES`
+(uncompressed). Private assets need `GITHUB_TOKEN`.
+
+## 24/7 operation, storage and cache
+
+`/info` (and `GET /api/info` in the Mini App) reports disk usage, cache size,
+active jobs and cleanup interval.
+
+- Cache directories older than `CACHE_MAX_AGE_SECONDS` are removed every
+  `CACHE_CLEANUP_INTERVAL_SECONDS` (both default to 3 hours).
+- Jobs left `queued` / `building` / `running` after a crash are marked failed
+  on the next start so they cannot block a concurrency slot.
+- Set `RESTART_ON_DISK_FULL=true` if a supervisor (systemd, Docker
+  `restart: unless-stopped`, Railway) should restart the process when disk
+  usage stays at or above `DISK_RESTART_PERCENT` after a cleanup. Leave it
+  `false` unless something is restarting the process for you.
+
+## Running without root (rootless Docker or Podman)
+
+The runner only talks to the Docker API, so it works on hosts where you have no
+root and no `sudo`: run the Docker daemon (or Podman) in rootless mode under your
+own user and point the bot at that socket. The bot never needs to be started as
+root.
+
+1. Enable the rootless engine (one time), then note the socket path:
+
+   ```bash
+   # Rootless Docker
+   systemctl --user enable --now docker
+   echo "unix:///run/user/$(id -u)/docker.sock"
+
+   # or rootless Podman
+   systemctl --user enable --now podman.socket
+   echo "unix:///run/user/$(id -u)/podman/podman.sock"
+   ```
+
+   Keep the user session alive for the bot, for example with `loginctl enable-linger "$USER"`.
+
+2. Point the bot at the socket. Add it to `.env` (see `.env.example`):
+
+   ```bash
+   DOCKER_HOST=unix:///run/user/1000/docker.sock
+   ```
+
+   If `DOCKER_HOST` is left empty the bot auto-detects `/var/run/docker.sock` first
+   and then falls back to the rootless Docker/Podman socket of the current user.
+
+3. When the bot itself runs from `docker-compose.yml`, mount that socket instead of
+   the system one and let Compose run the container as your user:
+
+   ```bash
+   DOCKER_SOCKET=/run/user/1000/docker.sock
+   RUN_AS_UID=$(id -u)
+   RUN_AS_GID=$(id -g)
+   ```
+
+   Both variables live in the same `.env` file that Compose reads. With rootless
+   engines the container's `root` is already mapped to your unprivileged host user,
+   so `RUN_AS_UID`/`RUN_AS_GID` are only needed when the socket is owned by a
+   different UID. On SELinux hosts add the `:z` mount flag to the socket and `data`
+   volumes in `docker-compose.yml`.
+
+Notes for rootless setups:
+
+- Job containers publish ports on `127.0.0.1`, which rootless port forwarding
+  exposes on the host loopback. Keep `PORT_RANGE_START`/`PORT_RANGE_END` above 1024
+  (the defaults are fine).
+- Resource limits (`MEM_LIMIT`, `NANO_CPUS`, `PIDS_LIMIT`) are enforced through
+  cgroup v2. They work on rootless Docker and Podman when cgroup delegation is
+  enabled; otherwise the kernel ignores them and the limits become best-effort.
+- If you get "Cannot connect to the Docker daemon", confirm the socket path with
+  `docker context ls` (rootless Docker) or `podman info --format '{{.Host.RemoteSocket.Path}}'`
+  and set `DOCKER_HOST` accordingly.
+
 ## Deployment on a VPS
 
 `docker-compose.yml` runs the bot with `network_mode: host` and mounts the Docker
@@ -103,6 +203,9 @@ socket so that containers it creates can publish ports on the host loopback.
 ```bash
 docker compose up -d --build
 ```
+
+For a rootless deployment set `DOCKER_SOCKET`, `RUN_AS_UID` and `RUN_AS_GID` in
+`.env` as described above before running the same command.
 
 Put a TLS reverse proxy in front of the web port. An example `Caddyfile` is included:
 
@@ -131,12 +234,16 @@ for the "Open Mini App" button to appear.
 
 | Command | Description |
 | --- | --- |
-| `/run <repo_url> [branch]` | Clone, build and run a repository |
+| `/run <repo_url\|release_zip_url> [branch] [port]` | Clone or unpack, build and run |
+| `/cancel <job_id>` | Cancel a queued, building or running job |
 | `/jobs` | List your recent jobs and their status |
-| `/status <job_id>` | Details for one job |
+| `/status <job_id>` | Details, build step and ETA |
+| `/api <job_id>` | API link, uptime, requests and health |
+| `/download <job_id>` | Hosted zip/tar of a release job |
+| `/info` | Disk, cache, active jobs and runtime |
 | `/logs <job_id>` | Recent build and runtime output |
 | `/stop <job_id>` | Stop a running job |
-| `/open` | Open the Mini App |
+| `/open` | Open the Mini App (Linux terminal + preview) |
 | `/help` | Show help |
 
 ## `.tgrunner.yml` override
@@ -170,6 +277,12 @@ All variables live in `.env.example`. The important ones:
 | `MEM_LIMIT`, `NANO_CPUS`, `PIDS_LIMIT` | Per-container resource limits |
 | `ENABLE_TERMINAL` | Enable or disable the web terminal |
 | `PREVIEW_BASE_DOMAIN` | Enables subdomain preview links |
+| `DOCKER_HOST` | Docker/Podman daemon socket; auto-detected when empty |
+| `DOCKER_SOCKET`, `RUN_AS_UID`, `RUN_AS_GID` | Compose only: socket path and UID/GID for the bot container |
+| `ARCHIVE_MAX_BYTES` | Max size of a downloaded release archive |
+| `CACHE_CLEANUP_INTERVAL_SECONDS` | How often finished-job cache is cleaned (default 3h) |
+| `CACHE_MAX_AGE_SECONDS` | Age after which a cache directory is removed |
+| `RESTART_ON_DISK_FULL` | Exit after cleanup if disk is still full (supervisor restarts) |
 | `DEV_LOGIN_USER_ID` | Local development only, never on a public deployment |
 
 ## Security

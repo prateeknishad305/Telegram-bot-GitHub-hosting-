@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+from .archive_client import ArchiveError, download_archive, extract_archive
 from .config import Settings
 from .db import Database
 from .detector import RunPlan, detect_plan, render_dockerfile
@@ -13,16 +16,48 @@ from .git_client import GitError, clone_repo
 from .models import Job, JobStatus, new_job_id
 from .monitor import ApiMonitor, format_metrics
 from .security import (
+    RepoRef,
+    SourceRef,
     ValidationError,
     check_owner_allowed,
-    parse_repo_url,
+    parse_source,
     redact_secrets,
     validate_branch,
+    validate_port,
 )
+
+logger = logging.getLogger(__name__)
 
 NotifyFn = Callable[[int, str], Awaitable[None]]
 
 DOCKERFILE_NAME = ".tgrunner.Dockerfile"
+
+_BUILD_STEP_RE = re.compile(r"(?:^|\s)Step\s+(\d+)/(\d+)\s", re.IGNORECASE)
+_BUILDKIT_STEP_RE = re.compile(r"^#(\d+)\s")
+
+
+def parse_build_progress(line: str) -> tuple[int, int] | None:
+    """Extract (current_step, total_steps) from a Docker build log line."""
+    match = _BUILD_STEP_RE.search(line)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    match = _BUILDKIT_STEP_RE.match(line.strip())
+    if match:
+        return int(match.group(1)), 0
+    return None
+
+
+def format_eta(seconds: float | None) -> str:
+    if seconds is None:
+        return "estimating..."
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return f"~{seconds}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"~{minutes}m {secs}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"~{hours}h {minutes}m"
 
 
 class JobError(RuntimeError):
@@ -50,6 +85,10 @@ class JobManager:
         self._log_buffers: dict[str, list[str]] = {}
         self._lock = asyncio.Lock()
         self._stopping = False
+        try:
+            self._loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
 
     async def create(
         self,
@@ -57,19 +96,27 @@ class JobManager:
         chat_id: int,
         repo_url: str,
         branch: str | None = None,
+        port: int | None = None,
     ) -> Job:
-        repo = parse_repo_url(repo_url)
+        repo = parse_source(repo_url)
         check_owner_allowed(repo, self.settings.allowed_repo_owners)
         branch = validate_branch(branch)
+        if repo.is_archive:
+            branch = None
+        port = validate_port(port)
 
         job = Job(
             id=new_job_id(),
             user_id=user_id,
             chat_id=chat_id,
-            repo_url=repo.clone_url,
+            repo_url=repo.url or repo.clone_url,
             repo_full_name=repo.full_name,
             branch=branch,
             status=JobStatus.QUEUED,
+            source_kind=repo.kind,
+            release_tag=repo.tag,
+            archive_name=repo.asset,
+            requested_port=port,
             log_path=str(self.settings.work_dir / "pending.log"),
         )
         work = self.settings.work_dir / job.id
@@ -83,6 +130,23 @@ class JobManager:
         self._tasks[job.id] = asyncio.create_task(self._run(job.id), name=f"job-{job.id}")
         return job
 
+    async def recover_stale_jobs(self) -> int:
+        """Fail jobs interrupted by a restart so they do not stay 'queued' forever."""
+        count = await self.db.fail_stale_jobs(
+            "Interrupted by a bot restart; please run it again."
+        )
+        try:
+            orphans = await asyncio.to_thread(self.runner.stop_orphans)
+        except DockerRunnerError:
+            orphans = 0
+        if count or orphans:
+            logger.warning(
+                "Recovered %s interrupted job(s) and removed %s leftover container(s)",
+                count,
+                orphans,
+            )
+        return count
+
     async def _run(self, job_id: str) -> None:
         async with self.semaphore:
             job = await self.db.get(job_id)
@@ -90,7 +154,7 @@ class JobManager:
                 return
             try:
                 await self._pipeline(job)
-            except (GitError, DockerRunnerError, ValidationError, JobError) as exc:
+            except (GitError, ArchiveError, DockerRunnerError, ValidationError, JobError) as exc:
                 await self._fail(job, str(exc))
             except asyncio.CancelledError:
                 await self._stop_container(job)
@@ -99,21 +163,17 @@ class JobManager:
                 await self._fail(job, f"{type(exc).__name__}: {exc}")
 
     async def _pipeline(self, job: Job) -> None:
-        repo = parse_repo_url(job.repo_url)
+        source = parse_source(job.repo_url)
         work = self.settings.work_dir / job.id
         repo_dir = work / "repo"
 
         await self._set_status(job, JobStatus.CLONING)
-        await self._log(job, f"==> Cloning {job.repo_full_name}" + (f"@{job.branch}" if job.branch else ""))
-        await self.notify(job.chat_id, f"Cloning `{job.repo_full_name}` ...")
+        if source.is_archive:
+            repo_dir = await self._fetch_archive(job, source, work, repo_dir)
+        else:
+            await self._clone_source(job, source, repo_dir)
 
-        token = self.settings.github_token
-        commit = await clone_repo(repo, repo_dir, branch=job.branch, token=token)
-        job.commit_sha = commit
-        job.branch = job.branch or None
-        await self._log(job, f"cloned at {commit[:10] or 'unknown'}")
-
-        plan = detect_plan(repo_dir)
+        plan = detect_plan(repo_dir, override_port=job.requested_port)
         job.base_image = plan.base_image or "repository Dockerfile"
         job.app_port = plan.app_port
         job.run_command = plan.run_command
@@ -137,11 +197,17 @@ class JobManager:
         )
 
         await self._set_status(job, JobStatus.BUILDING)
+        commit = job.commit_sha or ""
         image_tag = f"tgbot-{job.id}:{(commit[:8] if commit else 'latest') or 'latest'}"
         job.image_tag = image_tag
+        job.build_started_at = time.time()
+        job.build_step = 0
+        job.build_total_steps = 0
         await self.db.save(job)
 
         await asyncio.to_thread(self._build_image, job, repo_dir, plan, image_tag)
+        job.build_step = job.build_total_steps or job.build_step
+        await self.db.save(job)
 
         host_port = self._allocate_port()
         job.host_port = host_port
@@ -178,6 +244,39 @@ class JobManager:
         asyncio.create_task(self._follow_logs(job), name=f"logs-{job.id}")
         await self._watch(job)
 
+    async def _clone_source(self, job: Job, source: SourceRef, repo_dir: Path) -> None:
+        await self._log(job, f"==> Cloning {job.repo_full_name}" + (f"@{job.branch}" if job.branch else ""))
+        await self.notify(job.chat_id, f"Cloning `{job.repo_full_name}` ...")
+        repo = RepoRef(owner=source.owner, name=source.name, full_name=source.full_name)
+        commit = await clone_repo(repo, repo_dir, branch=job.branch, token=self.settings.github_token)
+        job.commit_sha = commit
+        job.branch = job.branch or None
+        await self._log(job, f"cloned at {commit[:10] or 'unknown'}")
+
+    async def _fetch_archive(self, job: Job, source: SourceRef, work: Path, repo_dir: Path) -> Path:
+        label = f"{job.repo_full_name}@{source.tag}" if source.tag else job.repo_full_name
+        await self._log(job, f"==> Downloading release archive {source.asset} ({label})")
+        await self.notify(
+            job.chat_id, f"Downloading release `{source.asset}` from `{job.repo_full_name}` ..."
+        )
+        archive = await download_archive(
+            source,
+            work / "download",
+            token=self.settings.github_token,
+            max_bytes=self.settings.archive_max_bytes,
+        )
+        job.archive_path = str(archive)
+        job.archive_name = archive.name
+        job.commit_sha = source.tag or ""
+        await self.db.save(job)
+        await self._log(job, f"downloaded {archive.name} ({archive.stat().st_size} bytes)")
+
+        root = await asyncio.to_thread(
+            extract_archive, archive, repo_dir, self.settings.archive_extract_max_bytes
+        )
+        await self._log(job, f"extracted to {root.relative_to(work)}")
+        return root
+
     def _build_image(self, job: Job, repo_dir: Path, plan: RunPlan, image_tag: str) -> None:
         if plan.uses_repo_dockerfile:
             dockerfile = "Dockerfile"
@@ -192,8 +291,37 @@ class JobManager:
             context=repo_dir,
             tag=image_tag,
             dockerfile=dockerfile,
-            on_log=lambda chunk: self._append_log(job, chunk),
+            on_log=lambda chunk: self._on_build_log(job, chunk),
         )
+
+    def _on_build_log(self, job: Job, chunk: str) -> None:
+        self._append_log(job, chunk)
+        progress = parse_build_progress(chunk)
+        if progress is None:
+            return
+        step, total = progress
+        if total:
+            job.build_total_steps = total
+        job.build_step = max(job.build_step, step)
+        eta = job.build_eta_seconds
+        if job.build_total_steps:
+            self._append_log(
+                job,
+                f"==> build progress {job.build_step}/{job.build_total_steps} (ETA {format_eta(eta)})\n",
+            )
+        else:
+            self._append_log(job, f"==> build step {job.build_step} (ETA {format_eta(eta)})\n")
+        try:
+            self.db_loop_call(job)
+        except Exception:
+            logger.debug("Could not persist build progress for %s", job.id, exc_info=True)
+
+    def db_loop_call(self, job: Job) -> None:
+        """Persist build progress from the build thread onto the event loop."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        asyncio.run_coroutine_threadsafe(self.db.save(job), loop)
 
     async def _watch(self, job: Job) -> None:
         while True:
@@ -299,12 +427,17 @@ class JobManager:
         preview = self.preview_url(job)
         kind = "API" if job.is_api else "app"
         extra = f"\nAPI details: /api {job.id}" if job.is_api else ""
+        download = self.download_url(job)
+        download_line = f"Download: {download}\n" if download else ""
+        source = f"Release: `{job.release_tag}`\n" if job.release_tag else ""
         return (
             f"Job `{job.id}` is *running* ({kind}).\n\n"
             f"Repo: `{job.repo_full_name}`\n"
+            f"{source}"
             f"Port: `{job.app_port}` (host `{job.host_port}`)\n"
             f"Run: `{job.run_command}`\n\n"
             f"Preview: {preview}{extra}\n"
+            f"{download_line}"
             f"Open the Mini App for the live terminal: {self.settings.public_base}/\n\n"
             f"Auto-stops in {self.settings.job_timeout_seconds // 60} min. Use /stop {job.id} to stop now."
         )
@@ -314,6 +447,11 @@ class JobManager:
             scheme = "https" if self.settings.public_url.startswith("https") else "http"
             return f"{scheme}://{job.id}.{self.settings.preview_base_domain.strip('.')}/"
         return f"{self.settings.public_base}/preview/{job.id}/"
+
+    def download_url(self, job: Job) -> str | None:
+        if not job.has_archive:
+            return None
+        return f"{self.settings.public_base}/download/{job.id}"
 
     def api_details(self, job: Job) -> str:
         return format_metrics(job, self.monitor.snapshot(job.id), self.preview_url(job))

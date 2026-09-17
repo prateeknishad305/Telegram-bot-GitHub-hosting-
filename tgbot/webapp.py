@@ -9,6 +9,7 @@ from .config import Settings
 from .db import Database
 from .docker_runner import DockerRunner
 from .jobs import JobManager
+from .maintenance import MaintenanceLoop, disk_usage, format_bytes
 from .models import Job, JobStatus
 from .monitor import ApiMonitor
 from .proxy import is_websocket, proxy_http, proxy_websocket
@@ -35,18 +36,21 @@ class WebServer:
         manager: JobManager,
         runner: DockerRunner,
         monitor: ApiMonitor,
+        maintenance: MaintenanceLoop | None = None,
     ):
         self.settings = settings
         self.db = db
         self.manager = manager
         self.runner = runner
         self.monitor = monitor
+        self.maintenance = maintenance
         self.app = web.Application(middlewares=[self._preview_host_middleware], client_max_size=4 * 1024 * 1024)
         self.app["settings"] = settings
         self.app["db"] = db
         self.app["manager"] = manager
         self.app["runner"] = runner
         self.app["monitor"] = monitor
+        self.app["maintenance"] = maintenance
         self._runner: web.AppRunner | None = None
         self._session: ClientSession | None = None
         self._setup_routes()
@@ -59,12 +63,14 @@ class WebServer:
         routes.add_static("/static/", WEB_DIR)
         routes.add_post("/api/session", self._api_session)
         routes.add_get("/api/me", self._api_me)
+        routes.add_get("/api/info", self._api_info)
         routes.add_route("GET", "/api/jobs", self._api_list_jobs)
         routes.add_post("/api/jobs", self._api_create_job)
         routes.add_get("/api/jobs/{job_id}", self._api_job_detail)
         routes.add_get("/api/jobs/{job_id}/metrics", self._api_job_metrics)
         routes.add_post("/api/jobs/{job_id}/stop", self._api_stop_job)
         routes.add_get("/ws/terminal/{job_id}", self._terminal)
+        routes.add_get("/download/{job_id}", self._download)
         routes.add_route("*", "/preview/{job_id}/{tail:.*}", self._preview)
 
     async def start(self) -> None:
@@ -149,6 +155,26 @@ class WebServer:
         user_id = await self._require_allowed(request)
         return web.json_response({"id": user_id, "is_admin": self.settings.is_admin(user_id)})
 
+    async def _api_info(self, request: web.Request) -> web.Response:
+        await self._require_allowed(request)
+        disk = disk_usage(self.settings.data_dir)
+        info = {
+            "disk": disk.as_dict(),
+            "disk_human": {
+                "total": format_bytes(disk.total),
+                "used": format_bytes(disk.used),
+                "free": format_bytes(disk.free),
+            },
+            "active_jobs": await self.db.count_active(),
+            "max_concurrent_jobs": self.settings.max_concurrent_jobs,
+            "job_timeout_seconds": self.settings.job_timeout_seconds,
+        }
+        if self.maintenance is not None:
+            snapshot = self.maintenance.snapshot()
+            snapshot["cache_human"] = format_bytes(snapshot["cache_bytes"])
+            info["maintenance"] = snapshot
+        return web.json_response(info)
+
     async def _api_list_jobs(self, request: web.Request) -> web.Response:
         user_id = await self._require_allowed(request)
         jobs = await self.db.list_for_user(user_id, 30)
@@ -166,6 +192,7 @@ class WebServer:
                 chat_id=user_id,
                 repo_url=str(data.get("repo_url", "")),
                 branch=data.get("branch") or None,
+                port=data.get("port") or None,
             )
         except ValidationError as exc:
             raise web.HTTPBadRequest(text=str(exc))
@@ -231,6 +258,22 @@ class WebServer:
         await bridge_terminal(ws, self.runner, job.container_id)
         return ws
 
+    async def _download(self, request: web.Request) -> web.StreamResponse:
+        job = await self.db.get(request.match_info["job_id"])
+        if job is None or not job.archive_path:
+            raise web.HTTPNotFound(text="No downloadable archive for this job")
+        path = Path(job.archive_path)
+        if not path.is_file():
+            raise web.HTTPNotFound(text="Archive is no longer available")
+        return web.FileResponse(
+            path,
+            headers={
+                "Content-Disposition": f'attachment; filename="{path.name}"',
+                "Content-Type": "application/octet-stream",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
     async def _preview(self, request: web.Request) -> web.StreamResponse:
         job = await self.db.get(request.match_info["job_id"])
         if job is None or job.status != JobStatus.RUNNING or not job.host_port:
@@ -246,6 +289,7 @@ class WebServer:
     def _serialize(self, job: Job) -> dict:
         payload = job.as_dict()
         payload["preview_url"] = self.manager.preview_url(job)
+        payload["download_url"] = self.manager.download_url(job)
         payload["miniapp_url"] = f"{self.settings.public_base}/"
         payload["metrics"] = self.manager.metrics(job) if job.status == JobStatus.RUNNING else None
         return payload

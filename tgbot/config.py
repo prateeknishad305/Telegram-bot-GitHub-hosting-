@@ -2,11 +2,54 @@ from __future__ import annotations
 
 import os
 import secrets
+from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+DEFAULT_DOCKER_HOST = "unix:///var/run/docker.sock"
+
+
+def normalize_docker_host(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return DEFAULT_DOCKER_HOST
+    if "://" in value:
+        return value
+    return f"unix://{value}"
+
+
+def rootless_socket_candidates() -> list[str]:
+    uid = os.getuid()
+    runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+    candidates = [
+        f"{runtime}/docker.sock",
+        f"/run/user/{uid}/docker.sock",
+        f"{runtime}/podman/podman.sock",
+        f"/run/user/{uid}/podman/podman.sock",
+    ]
+    return list(dict.fromkeys(candidates))
+
+
+def discover_docker_host(
+    explicit: str | None = None,
+    env: str | None = None,
+    exists: Callable[[str], bool] | None = None,
+) -> str:
+    exists = exists or os.path.exists
+    if explicit:
+        return normalize_docker_host(explicit)
+    env_value = env if env is not None else os.environ.get("DOCKER_HOST")
+    if env_value:
+        return normalize_docker_host(env_value)
+    if exists(DEFAULT_DOCKER_HOST.removeprefix("unix://")):
+        return DEFAULT_DOCKER_HOST
+    for candidate in rootless_socket_candidates():
+        if exists(candidate):
+            return normalize_docker_host(candidate)
+    return DEFAULT_DOCKER_HOST
 
 
 def _split_ints(raw: str) -> set[int]:
@@ -68,6 +111,20 @@ class Settings(BaseSettings):
 
     data_dir: Path = Field(default=Path("./data"), alias="DATA_DIR")
     docker_network: str = Field(default="tgbot-runner", alias="DOCKER_NETWORK")
+    docker_host: str | None = Field(default=None, alias="DOCKER_HOST")
+
+    archive_max_bytes: int = Field(default=512 * 1024 * 1024, alias="ARCHIVE_MAX_BYTES")
+    archive_extract_max_bytes: int = Field(
+        default=2 * 1024 * 1024 * 1024, alias="ARCHIVE_EXTRACT_MAX_BYTES"
+    )
+
+    cache_cleanup_interval_seconds: int = Field(
+        default=3 * 3600, alias="CACHE_CLEANUP_INTERVAL_SECONDS"
+    )
+    cache_max_age_seconds: int = Field(default=3 * 3600, alias="CACHE_MAX_AGE_SECONDS")
+    restart_on_disk_full: bool = Field(default=False, alias="RESTART_ON_DISK_FULL")
+    disk_restart_percent: float = Field(default=95.0, alias="DISK_RESTART_PERCENT")
+    stale_job_grace_seconds: int = Field(default=120, alias="STALE_JOB_GRACE_SECONDS")
 
     @model_validator(mode="after")
     def _apply_runtime_port(self) -> Settings:
@@ -99,6 +156,9 @@ class Settings(BaseSettings):
     @property
     def public_base(self) -> str:
         return self.public_url.rstrip("/")
+
+    def resolved_docker_host(self) -> str:
+        return discover_docker_host(self.docker_host)
 
     def secret(self) -> str:
         if self.session_secret:

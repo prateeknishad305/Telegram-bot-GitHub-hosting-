@@ -4,6 +4,12 @@ services:
     restart: unless-stopped
     env_file: .env
     network_mode: host
+    # Run as the host user that owns the Docker/Podman socket (rootless friendly).
+    # Defaults to root inside the container, which rootless Docker already maps to
+    # your unprivileged host user.
+    user: "${RUN_AS_UID:-0}:${RUN_AS_GID:-0}"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      # Point this at your socket, e.g. /run/user/1000/docker.sock for rootless
+      # Docker or /run/user/1000/podman/podman.sock for rootless Podman.
+      - "${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock"
       - ./data:/data
